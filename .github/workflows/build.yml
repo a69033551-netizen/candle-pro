@@ -1,0 +1,493 @@
+name: Build Candle Pro APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write app source
+        run: |
+          mkdir -p app/src/main/java/com/candlepro/overlay
+          cat > settings.gradle <<'CANDLE_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "CandleProOverlay"
+          include ':app'
+          CANDLE_EOF
+          cat > build.gradle <<'CANDLE_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          CANDLE_EOF
+          cat > gradle.properties <<'CANDLE_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          CANDLE_EOF
+          cat > app/build.gradle <<'CANDLE_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.candlepro.overlay'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.candlepro.overlay'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          CANDLE_EOF
+          cat > app/src/main/AndroidManifest.xml <<'CANDLE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Candle Pro Overlay"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          CANDLE_EOF
+          cat > app/src/main/java/com/candlepro/overlay/Analyzer.java <<'CANDLE_EOF'
+          package com.candlepro.overlay;
+
+          import android.graphics.Rect;
+
+          import java.nio.ByteBuffer;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.List;
+
+          /**
+           * Reads candles from a screenshot by color, and turns them into a next-candle
+           * probability using common indicators. Prices are in "pixel units": price = -y,
+           * so a higher candle on screen means a higher price.
+           */
+          public class Analyzer {
+
+              public static final int MIN = 30;
+
+              public static class Candle {
+                  public float x;
+                  public double o, h, l, c;
+              }
+
+              public static class Result {
+                  public final List<Candle> candles = new ArrayList<>();
+                  public float spacing = 12f;
+                  public float bodyWidth = 6f;
+              }
+
+              public static class Signal {
+                  public String name;
+                  public String value;
+                  public double s;
+                  public double w;
+
+                  Signal(String name, String value, double s, double w) {
+                      this.name = name;
+                      this.value = value;
+                      this.s = s;
+                      this.w = w;
+                  }
+              }
+
+              public static class Prediction {
+                  public int up;
+                  public double score;
+                  public double atr;
+                  public List<Signal> sigs = new ArrayList<>();
+              }
+
+              private static class Cluster {
+                  int xs, xe, type;
+                  int high, low, bodyTop, bodyBot;
+
+                  int width() {
+                      return xe - xs + 1;
+                  }
+
+                  float cx() {
+                      return (xs + xe) / 2f;
+                  }
+              }
+
+              private int[] gCnt, rCnt, gMin, gMax, rMin, rMax;
+
+              private void ensure(int w) {
+                  if (gCnt == null || gCnt.length != w) {
+                      gCnt = new int[w];
+                      rCnt = new int[w];
+                      gMin = new int[w];
+                      gMax = new int[w];
+                      rMin = new int[w];
+                      rMax = new int[w];
+                  }
+                  Arrays.fill(gCnt, 0);
+                  Arrays.fill(rCnt, 0);
+                  Arrays.fill(gMin, Integer.MAX_VALUE);
+                  Arrays.fill(rMin, Integer.MAX_VALUE);
+                  Arrays.fill(gMax, -1);
+                  Arrays.fill(rMax, -1);
+              }
+
+              static boolean isGreen(int r, int g, int b) {
+                  return g >= 110 && g > r + 40 && g > b + 20;
+              }
+
+              static boolean isRed(int r, int g, int b) {
+                  return r >= 140 && r > g + 60 && r > b + 40;
+              }
+
+              public Result analyze(ByteBuffer buf, int rowStride, int pixStride, int w, int h,
+                                    int y0, int y1, Rect excl) {
+                  ensure(w);
+                  y0 = Math.max(0, y0);
+                  y1 = Math.min(h, y1);
+                  int limit = buf.limit();
+                  for (int y = y0; y < y1; y++) {
+                      int base = y * rowStride;
+                      boolean rowEx = excl != null && y >= excl.top && y < excl.bottom;
+                      for (int x = 0; x < w; x++) {
+                          if (rowEx && x >= excl.left && x < excl.right) continue;
+                          int i = base + x * pixStride;
+                          if (i + 2 >= limit) break;
+                          int r = buf.get(i) & 0xFF;
+                          int g = buf.get(i + 1) & 0xFF;
+                          int b = buf.get(i + 2) & 0xFF;
+                          if (isGreen(r, g, b)) {
+                              gCnt[x]++;
+                              if (y < gMin[x]) gMin[x] = y;
+                              gMax[x] = y;
+                          } else if (isRed(r, g, b)) {
+                              rCnt[x]++;
+                              if (y < rMin[x]) rMin[x] = y;
+                              rMax[x] = y;
+                          }
+                      }
+                  }
+
+                  int[] type = new int[w];
+                  for (int x = 0; x < w; x++) {
+                      if (gCnt[x] >= 2 && gCnt[x] >= rCnt[x]) type[x] = 1;
+                      else if (rCnt[x] >= 2) type[x] = 2;
+                  }
+
+                  int maxW = Math.max(8, w / 22);
+                  List<Cluster> clusters = new ArrayList<>();
+                  int x = 0;
+                  while (x < w) {
+                      if (type[x] == 0) {
+                          x++;
+                          continue;
+                      }
+                      int t = type[x];
+                      int xs = x;
+                      int xe = x;
+                      int k = x + 1;
+                      while (k < w) {
+                          if (type[k] == t) {
+                              xe = k;
+                              k++;
+                          } else if (k + 1 < w && type[k] == 0 && type[k + 1] == t) {
+                              k++;
+                          } else {
+                              break;
+                          }
+                      }
+                      x = xe + 1;
+                      int width = xe - xs + 1;
+                      if (width < 2 || width > maxW) continue;
+
+                      int[] mins = new int[width];
+                      int[] maxs = new int[width];
+                      int n = 0;
+                      int high = Integer.MAX_VALUE;
+                      int low = -1;
+                      for (int c = xs; c <= xe; c++) {
+                          int mn = t == 1 ? gMin[c] : rMin[c];
+                          int mx = t == 1 ? gMax[c] : rMax[c];
+                          if (mx < 0) continue;
+                          mins[n] = mn;
+                          maxs[n] = mx;
+                          n++;
+                          if (mn < high) high = mn;
+                          if (mx > low) low = mx;
+                      }
+                      if (n == 0 || low - high < 2) continue;
+                      int[] mi = Arrays.copyOf(mins, n);
+                      int[] ma = Arrays.copyOf(maxs, n);
+                      Arrays.sort(mi);
+                      Arrays.sort(ma);
+                      Cluster cl = new Cluster();
+                      cl.xs = xs;
+                      cl.xe = xe;
+                      cl.type = t;
+                      cl.high = high;
+                      cl.low = low;
+                      cl.bodyTop = mi[n / 2];
+                      cl.bodyBot = ma[n / 2];
+                      if (cl.bodyBot < cl.bodyTop) cl.bodyBot = cl.bodyTop;
+                      clusters.add(cl);
+                  }
+
+                  Result res = new Result();
+                  if (clusters.size() < 3) return res;
+
+                  // Typical candle width, then drop shapes that are far off it (text, icons).
+                  float[] widths = new float[clusters.size()];
+                  for (int i = 0; i < clusters.size(); i++) widths[i] = clusters.get(i).width();
+                  float medW = median(widths);
+                  List<Cluster> sized = new ArrayList<>();
+                  for (Cluster c : clusters) {
+                      if (c.width() >= medW * 0.5f && c.width() <= medW * 2.2f) sized.add(c);
+                  }
+                  if (sized.size() < 3) return res;
+
+                  float[] gaps = new float[sized.size() - 1];
+                  for (int i = 1; i < sized.size(); i++) gaps[i - 1] = sized.get(i).cx() - sized.get(i - 1).cx();
+                  float sp = median(gaps);
+                  if (sp < 2f) return res;
+
+                  // Walk from the newest candle (right) to the left while spacing stays regular.
+                  List<Cluster> chain = new ArrayList<>();
+                  Cluster prev = sized.get(sized.size() - 1);
+                  chain.add(prev);
+                  for (int i = sized.size() - 2; i >= 0; i--) {
+                      Cluster c = sized.get(i);
+                      float gap = prev.cx() - c.cx();
+                      if (gap < sp * 0.55f) continue;
+                      if (gap > sp * 2.6f) break;
+                      chain.add(c);
+                      prev = c;
+                  }
+
+                  for (int i = chain.size() - 1; i >= 0; i--) {
+                      Cluster c = chain.get(i);
+                      Candle cd = new Candle();
+                      cd.x = c.cx();
+                      cd.h = -c.high;
+                      cd.l = -c.low;
+                      if (c.type == 1) {
+                          cd.o = -c.bodyBot;
+                          cd.c = -c.bodyTop;
+                      } else {
+                          cd.o = -c.bodyTop;
+                          cd.c = -c.bodyBot;
+                      }
+                      res.candles.add(cd);
+                  }
+                  res.spacing = sp;
+                  res.bodyWidth = Math.max(3f, medW);
+                  return res;
+              }
+
+              private static float median(float[] a) {
+                  float[] b = Arrays.copyOf(a, a.length);
+                  Arrays.sort(b);
+                  return b[b.length / 2];
+              }
+
+              /* ---------------- indicators ---------------- */
+
+              private static double[] ema(double[] a, int n) {
+                  double k = 2.0 / (n + 1);
+                  double[] o = new double[a.length];
+                  double e = a[0];
+                  o[0] = e;
+                  for (int i = 1; i < a.length; i++) {
+                      e = a[i] * k + e * (1 - k);
+                      o[i] = e;
+                  }
+                  return o;
+              }
+
+              private static double rsi(double[] c, int n) {
+                  double g = 0, l = 0;
+                  for (int i = 1; i <= n; i++) {
+                      double d = c[i] - c[i - 1];
+                      if (d > 0) g += d;
+                      else l -= d;
+                  }
+                  g /= n;
+                  l /= n;
+                  for (int i = n + 1; i < c.length; i++) {
+                      double d = c[i] - c[i - 1];
+                      g = (g * (n - 1) + Math.max(d, 0)) / n;
+                      l = (l * (n - 1) + Math.max(-d, 0)) / n;
+                  }
+                  if (l == 0) return g == 0 ? 50 : 100;
+                  return 100 - 100 / (1 + g / l);
+              }
+
+              private static double clamp(double v) {
+                  return Math.max(-1, Math.min(1, v));
+              }
+
+              public static Prediction predict(List<Candle> cl) {
+                  int n = cl.size();
+                  double[] c = new double[n];
+                  for (int i = 0; i < n; i++) c[i] = cl.get(i).c;
+                  Candle last = cl.get(n - 1);
+
+                  double atr = 0;
+                  for (int i = n - 14; i < n; i++) atr += cl.get(i).h - cl.get(i).l;
+                  atr /= 14;
+                  if (atr <= 0) atr = 1;
+
+                  double[] e9 = ema(c, 9);
+                  double[] e21 = ema(c, 21);
+                  double r = rsi(c, 14);
+                  double[] e12 = ema(c, 12);
+                  double[] e26 = ema(c, 26);
+                  double[] macd = new double[n];
+                  for (int i = 0; i < n; i++) macd[i] = e12[i] - e26[i];
+                  double[] sig = ema(macd, 9);
+                  double hist = macd[n - 1] - sig[n - 1];
+                  double histP = macd[n - 2] - sig[n - 2];
+
+                  double m = 0;
+                  for (int i = n - 20; i < n; i++) m += c[i];
+                  m /= 20;
+                  double sd = 0;
+                  for (int i = n - 20; i < n; i++) sd += (c[i] - m) * (c[i] - m);
+                  sd = Math.sqrt(sd / 20);
+                  if (sd == 0) sd = 1e-9;
+                  double pb = (c[n - 1] - (m - 2 * sd)) / (4 * sd);
+                  double mom = (c[n - 1] - c[n - 4]) / atr;
+                  double body = last.c - last.o;
+                  double rng = last.h - last.l;
+                  if (rng <= 0) rng = 1e-9;
+
+                  Prediction p = new Prediction();
+                  p.sigs.add(new Signal("ট্রেন্ড (EMA 9/21)",
+                          e9[n - 1] > e21[n - 1] ? "আপট্রেন্ড" : "ডাউনট্রেন্ড",
+                          clamp((e9[n - 1] - e21[n - 1]) / atr), 1.2));
+                  double sR = r > 70 ? -(r - 70) / 15 : r < 30 ? (30 - r) / 15 : (r - 50) / 40;
+                  p.sigs.add(new Signal("RSI", String.format(java.util.Locale.US, "%.0f", r), clamp(sR), 1.0));
+                  p.sigs.add(new Signal("MACD", hist > 0 ? "বুলিশ" : "বেয়ারিশ",
+                          clamp((hist + 2 * (hist - histP)) / (atr * 0.3)), 1.0));
+                  p.sigs.add(new Signal("মোমেন্টাম", mom >= 0 ? "উপরে" : "নিচে", clamp(mom / 2), 0.8));
+                  double sB = pb > 0.9 ? -(pb - 0.9) * 5 : pb < 0.1 ? (0.1 - pb) * 5 : 0;
+                  p.sigs.add(new Signal("Bollinger", String.format(java.util.Locale.US, "%.0f%%", pb * 100), clamp(sB), 0.9));
+                  p.sigs.add(new Signal("শেষ ক্যান্ডেল", body >= 0 ? "সবুজ" : "লাল", clamp(body / rng * 0.8), 0.5));
+
+                  double num = 0, den = 0;
+                  for (Signal s : p.sigs) {
+                      num += s.s * s.w;
+                      den += s.w;
+                  }
+                  p.score = num / den;
+                  p.up = (int) Math.round(50 + 32 * Math.tanh(2 * p.score));
+                  p.atr = atr;
+                  return p;
+              }
+          }
+          CANDLE_EOF
+          cat > app/src/main/java/com/candlepro/overlay/GhostView.java <<'CANDLE_EOF'
+          package com.candlepro.overlay;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.DashPathEffect;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.view.View;
+
+          /** Full-screen, touch-through layer that draws the predicted next candle. */
+          public class GhostView extends View {
+
+              private static final int UP = 0xFF22C39A;
+              private static final int DOWN = 0xFFEF5A6F;
+              private static final int GOLD = 0xFFE9B44C;
+
+              private Analyzer.Result res;
+              private Analyzer.Prediction pr;
+              private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint tag = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final int[] loc = new int[2];
+              private final float dp;
+
+              public GhostView(Context ctx) {
+                  super(ctx);
+                  dp = ctx.getResources().getDisplayMetrics().density;
+                  fill.setStyle(Paint.Style.FILL);
+                  stroke.setStyle(Paint.Style.STROKE);
+                  stroke.setColor(0xFFFFFFFF);
+                  stroke.setStrokeWidth(1.5f * dp);
+                  stroke.setPathEffect(new DashPathEffect(new float[]{4 * dp, 3 * dp}, 0));
+                  tag.setStyle(Paint.Style.FILL);
+                  tag.setColor(GOLD);
+                  text.setColor(0xFF15110A);
+                  text.setTextSize(13 * dp);
+                  text.setFakeBoldText(true);
+              }
+
+              public void setData(Analyzer.Result r, Analyzer.Prediction p) {
+                  res = r;
+                  pr = p;
+                  invalidate();
+              }
+
+              @Override
+              protected void onDraw(Canvas c) {
+                  super.onDraw(c);
+                  if (res == null || pr == null || res.candles.isEmpty()) return;
+                  getLocationOnScreen(loc);
+                  Analyzer.Candle last = res.candles.get(res.candles.size() - 1);
+                  boolean up = pr.up >= 50;
+                  float bw = Math.max(4 * dp, res.bodyWidth);
+                  float gx = last.x + res.spacing - loc[0];
+                  float mag = (float) (pr.atr * 0.5 * (0.6 + Math.abs(pr.score)));
+                  float o = (float) last.c;
+                  float cl = up ? o + mag : o - mag;
+                  float yTop = -Math.max
